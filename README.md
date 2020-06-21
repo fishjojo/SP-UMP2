@@ -27,3 +27,8 @@ energy_xterms
 get_matrix_element
 norm
 ```
+
+## Index
+`Energy.ipynb`: Jupyter notebook with energy plots.
+`normalization.ipynb`: Jupyter notebook with normalization plots.
+`sppt2_v2.py`: Code for SPPT2 implementation.
