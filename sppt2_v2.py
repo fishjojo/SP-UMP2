@@ -527,8 +527,7 @@ class SPPT2:
                 mo_occ = mp2.mo_occ
                 mp2_norm = 1 + self.norm_11(mo_coeff, mo_coeff, mo_occ, mo_occ, t2, t2)
                 
-                # Don't want to repeatedly add the nuclear energy.
-                E_mp2 = mp2.e_tot - self.mol.energy_nuc()
+                E_mp2 = mp2.e_tot
                 
                 if just_mp2:
                     # If s = m = k = 0, then d^s_mk = 1 and numpy.exp(1j * m * alpha_t) = 1.
@@ -544,7 +543,6 @@ class SPPT2:
                 print(f'ws_g = {ws[g]}')
                 print(f'd^s_mk = {self.get_wigner_d(s, m, k, beta_g)}\n')
         
-        E += self.mol.energy_nuc()
         E += self.energy_xterms(s, m, k, order=order)
         
         # <Psi | H | Psi> / <Psi | Psi>
@@ -593,10 +591,11 @@ class SPPT2:
             print(f'A {A.shape}: \n{A}\n')
             print(f'trans rdm1 {trans_rdm1.shape}: \n{trans_rdm1}\n')
         
-        part1 = numpy.einsum('ijkl, ki->jl', mo_eri, trans_rdm1)
-        part2 = numpy.einsum('ijlk, ki->jl', mo_eri, trans_rdm1)
+        # sum{ h_ik rho_ki + 1/2 <ij||kl> rho_ki rho_lj}
+        part1 = numpy.einsum('ikjl, ki->jl', mo_eri, trans_rdm1)
+        part2 = numpy.einsum('iljk, ki->lj', mo_eri, trans_rdm1)
         term = numpy.einsum('ik, ki', mo_hcore, trans_rdm1) + 0.5 * (
-                numpy.einsum('jl, lj', part1, trans_rdm1) - numpy.einsum('jl, lj', part2, trans_rdm1))
+                numpy.einsum('jl, lj', part1, trans_rdm1) - numpy.einsum('jl, lj', part2, trans_rdm1)) + self.mol.energy_nuc()
 
         if divide:
             return term
@@ -894,7 +893,7 @@ class SPPT2:
         return E_euhf
     
 
-        def get_quad_rdms(self):
+    def get_quad_rdms(self):
         """
         Get the 1-particle and 2-particle MP2 density matrices at the quadrature points.
         """
