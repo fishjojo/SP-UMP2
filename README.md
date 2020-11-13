@@ -13,7 +13,7 @@ mol.build()
 test = sppt2_v10.SPPT2(mol)
 ```
 
-To compute the energy:
+To compute the energy using the CO-version:
 ```
 # Spin quantum numbers.
 s, m, k = 0, 0, 0
@@ -27,4 +27,9 @@ test = sppt2_v10.SPPT2(mol)
 uhf = test.do_uhf()
 ump2 = test.do_mp2(uhf)
 e = test.energy_v4(s, m, k, ump2, N_alpha=N_alpha, N_beta=N_beta, N_gamma=N_gamma)
+```
+
+To compute the energy using the prototype:
+```
+e = test.energy(s, m, k, uhf, ump2, N_alpha=N_alpha, N_beta=N_beta, N_gamma=N_gamma)
 ```
