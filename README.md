@@ -1,4 +1,9 @@
 # SPPT2
+
+## Dependencies
+PySCF: `dfgmp2` branch available at https://github.com/shufay/pyscf/tree/dfgmp2.
+
+## Run
 To initialize an `SPPT2` object:
 
 ```
