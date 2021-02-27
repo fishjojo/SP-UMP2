@@ -1558,4 +1558,4 @@ if __name__ == '__main__':
     test = SPPT2(mol)
     uhf = test.do_uhf()
     ump2 = test.do_mp2(uhf)
-    e = test.energy_v4(s, m, k, ump2, N_alpha=N_alpha, N_beta=N_beta, N_gamma=N_gamma)
+    e = test.energy(s, m, k, ump2, N_alpha=N_alpha, N_beta=N_beta, N_gamma=N_gamma)
