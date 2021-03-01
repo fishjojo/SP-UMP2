@@ -1,4 +1,4 @@
-# SPPT2
+# SP-UMP2
 
 ## Dependencies
 PySCF: `dfgmp2` branch available at https://github.com/shufay/pyscf/tree/dfgmp2.
