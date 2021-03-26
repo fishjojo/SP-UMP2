@@ -1,4 +1,10 @@
-# SPPT2
+# SP-UMP2
+SP-UMP2 and SPPT2 refer to the same method and are used interchangeably.
+
+## Dependencies
+PySCF: `dfgmp2` branch available at https://github.com/shufay/pyscf/tree/dfgmp2.
+
+## Run
 To initialize an `SPPT2` object:
 
 ```
