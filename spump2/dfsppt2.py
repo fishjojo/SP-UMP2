@@ -12,11 +12,12 @@ V13
 from functools import reduce
 from itertools import combinations
 import ctypes
+import tempfile
 import numpy
 import scipy.special
 
 from pyscf import lib
-from pyscf.lib import logger
+from pyscf.lib import logger, param
 from pyscf import gto, scf, mp, fci, ao2mo
 from pyscf.scf import hf
 from pyscf import df
@@ -26,13 +27,6 @@ from . import lib as tools
 libnp_helper = tools.load_library("libnp_helper")
 
 SWITCH_SIZE = 800 #need test
-
-def ao2mo_slow(eri_ao, mo_coeffs):
-    nao = mo_coeffs[0].shape[0]
-    eri_ao_s1 = ao2mo.restore(1, eri_ao, nao)
-    return lib.einsum('pqrs,pi,qj,rk,sl->ijkl', eri_ao_s1.reshape([nao]*4),
-                      mo_coeffs[0].conj(), mo_coeffs[1],
-                      mo_coeffs[2].conj(), mo_coeffs[3])
 
 class SPPT2:
     def __init__(self, mf):
@@ -60,6 +54,7 @@ class SPPT2:
             e_elec_hf (float): Electronic part of HF energy.
         """
         self._scf = mf
+        self.mo_coeff = mf.mo_coeff
         self.mol = mf.mol
         if getattr(mf, 'with_df', None):
             self.with_df = mf.with_df
@@ -82,6 +77,10 @@ class SPPT2:
         self.e_tot = None
         self.e_hf = None
         self.e_elec_hf = None
+
+        self.mo_eri_file = None
+        self.co_eri_file = None
+        self.co_t2_file = None
 
     def generate_quad_part(self, N_beta=None, verbose=False):
         """
@@ -444,6 +443,8 @@ class SPPT2:
         if self.mo_eri is None:
             self.mo_eri = self.ao2mo(mo_coeff1)
 
+        nocc = self.nocc
+
         mo_hcore = self.get_mo_hcore(mo_coeff1)
         A = self.get_A_matrix(mo_coeff1, mo_coeff2, mo_occ)
         M = self.get_M_matrix(A)
@@ -458,11 +459,25 @@ class SPPT2:
         # When adding dm1 contribution, dm1 subscripts need to be flipped
         #
         # sum{ h_ik rho_ki + 1/2 <ij||kl> rho_ki rho_lj}
-        eri_opop = self.mo_eri.opop
-        h1  = mo_hcore[:self.nocc]
-        h1 += .5 * lib.einsum('ikjl,ki->jl', eri_opop, trans_rdm1)
-        h1 -= .5 * lib.einsum('iljk,ki->jl', eri_opop, trans_rdm1)
-        e1 = ovlp * numpy.einsum('ik,ki', h1, trans_rdm1)
+        h1  = mo_hcore[:nocc]
+        e1 = numpy.einsum('ip,pi', h1, trans_rdm1)
+
+        Poo = trans_rdm1[:nocc]
+        PooT = numpy.asarray(Poo.T, order="C")
+        Pvo = trans_rdm1[nocc:]
+        PvoT = numpy.asarray(Pvo.T, order="C")
+        eri_oooo = self.mo_eri.oooo
+        eri_ooov = self.mo_eri.ooov
+        eri_ovov = self.mo_eri.ovov
+
+        for i in range(nocc):
+            e1 += .5 * lib.einsum('kjl,k,lj->', eri_oooo[i], PooT[i], Poo)
+            e1 += .5 * lib.einsum('kjl,k,lj->', eri_ovov[i], PvoT[i], Pvo)
+            e1 += lib.einsum('kjl,k,lj->', eri_ooov[i], PooT[i], Pvo)
+            e1 -= .5 * lib.einsum('ljk,k,lj->', eri_oooo[i], PooT[i], Poo)
+            e1 -= .5 * lib.einsum('ljk,k,lj->', eri_ovov[i], PvoT[i], Pvo)
+            e1 -= lib.einsum('ljk,k,lj->', eri_ooov[i], PvoT[i], Poo)
+        e1 = ovlp * e1
         return e1
     
     def get_A_matrix(self, mo_coeff1, mo_coeff2, mo_occ2):
@@ -647,6 +662,25 @@ class SPPT2:
         S_ijpr_mat = tmp[None,None,:,:] + tmp1
         return S_ijpr_mat
 
+    def get_S_ijpr_matrix_i(self, co_ovlp, co_ovlp_oo_diag):
+        nocc = self.nocc
+        nvir = self.nmo - nocc
+
+        co_ovlp_vv = co_ovlp[nocc:,nocc:]
+        co_ovlp_ov = co_ovlp[:nocc,nocc:]
+        co_ovlp_vo = co_ovlp[nocc:,:nocc]
+        co_ovlp_oo_inv = 1. / co_ovlp_oo_diag
+        #S_ipr = numpy.einsum("pk,kr,k->kpr", co_ovlp_vo, co_ovlp_ov, co_ovlp_oo_inv)
+        S_ipr = co_ovlp_vo.T[:,:,None] * co_ovlp_ov[:,None,:] * co_ovlp_oo_inv[:,None,None]
+        S_pr = numpy.sum(S_ipr, axis=0)
+
+        tmp = co_ovlp_vv - S_pr
+        for i in range(nocc):
+            tmp1 = S_ipr[i,None,:,:] + S_ipr
+            tmp1[i,:,:] *= .5
+            S_ijpr_mat = tmp[None,:,:] + tmp1
+            yield S_ijpr_mat
+
     def get_S_ipr_matrix_slow(self, co_ovlp, co_ovlp_oo_diag):
         """
         Constructs the S_ipr tensor used in the evaluation of <Psi_{UHF}|H R|Psi_{UHF}^{1}>.
@@ -697,11 +731,43 @@ class SPPT2:
         nocc = self.nocc
         nmo = self.nmo
         nvir = nmo - nocc
-        co_eri_oovv = co_eri.transpose(0,2,1,3) - co_eri.transpose(0,2,3,1)
+        #co_eri_oovv = co_eri.transpose(0,2,1,3) - co_eri.transpose(0,2,3,1)
         co_ovlp_oo_inv = 1. / co_ovlp_oo_diag
+        Sij_inv = co_ovlp_oo_inv[:,None]*co_ovlp_oo_inv[None,:]
 
+        sumadij = 0
+        sumc_ijad = numpy.empty((nocc,nvir,nvir), order='C', dtype=co_ovlp.dtype)
+        sumb_ijad = numpy.empty((nocc,nvir,nvir), order='C', dtype=co_ovlp.dtype)
+        for i, S_ijpr_matrix_i in enumerate(self.get_S_ijpr_matrix_i(co_ovlp, co_ovlp_oo_diag)):
+            S_ijpr_matrix_i = numpy.asarray(S_ijpr_matrix_i, order='C')
+            co_eri_oovv_i = co_eri[i].transpose(1,0,2) - co_eri[i].transpose(1,2,0)
+            co_eri_oovv_i = numpy.asarray(co_eri_oovv_i, order='C')
+            co_t2_i = numpy.asarray(co_t2[i], order='C')
+
+            if co_ovlp.dtype == numpy.double:
+                fn = getattr(libnp_helper, "contract_o2v3_i", None)
+            elif co_ovlp.dtype == numpy.complex:
+                fn = getattr(libnp_helper, "contract_o2v3_i_cmplx", None)
+
+            try:
+                case0 = 0
+                case1 = 1
+                fn(sumc_ijad.ctypes.data_as(ctypes.c_void_p),
+                   S_ijpr_matrix_i.ctypes.data_as(ctypes.c_void_p),
+                   co_eri_oovv_i.ctypes.data_as(ctypes.c_void_p),
+                   ctypes.c_int(nocc), ctypes.c_int(nvir), ctypes.c_int(case0))
+                fn(sumb_ijad.ctypes.data_as(ctypes.c_void_p),
+                   co_t2_i.ctypes.data_as(ctypes.c_void_p),
+                   S_ijpr_matrix_i.ctypes.data_as(ctypes.c_void_p),
+                   ctypes.c_int(nocc), ctypes.c_int(nvir), ctypes.c_int(case1))
+            except:
+                raise RuntimeError
+
+            tmp = sumb_ijad * Sij_inv[i,:,None,None]
+            sumadij += lib.einsum('jad,jad->', sumc_ijad, tmp)
+
+        '''
         S_ijpr_matrix = self.get_S_ijpr_matrix(co_ovlp, co_ovlp_oo_diag)
-
         S_ijpr_matrix = numpy.asarray(S_ijpr_matrix, order='C')
         co_t2 = numpy.asarray(co_t2, order='C')
         sumc_ijad = numpy.empty((nocc,nocc,nvir,nvir), order='C', dtype=co_ovlp.dtype)
@@ -731,7 +797,7 @@ class SPPT2:
         Sij_inv = co_ovlp_oo_inv[:,None]*co_ovlp_oo_inv[None,:]
         tmp = sumb_ijad * Sij_inv[:,:,None,None]
         sumadij = lib.einsum('ijad,ijad->', sumc_ijad, tmp)
-
+        '''
         return sumadij * 0.25 * numpy.prod(co_ovlp_oo_diag)
     
     def energy_01_term2_case2(self, co_t2, co_eri, co_ovlp, co_ovlp_oo_diag):
@@ -741,13 +807,33 @@ class SPPT2:
         nocc = self.nocc
         nmo = self.nmo
         nvir = nmo - nocc
-        co_eri_oovv = co_eri.transpose(0,2,1,3) - co_eri.transpose(0,2,3,1)
+        #co_eri_oovv = co_eri.transpose(0,2,1,3) - co_eri.transpose(0,2,3,1)
         co_ovlp_oo_inv = 1. / co_ovlp_oo_diag
         co_ovlp_vo = co_ovlp[nocc:, :nocc]
         co_ovlp_ov = co_ovlp[:nocc, nocc:]
 
         S_ipr_matrix = self.get_S_ipr_matrix(co_ovlp, co_ovlp_oo_diag)
-        
+
+        term1 = 0
+        term2 = 0
+
+        tmp = co_ovlp_vo * co_ovlp_oo_inv[None,:]
+        tmp1 = co_ovlp_ov * co_ovlp_oo_inv[:,None]
+        for i in range(nocc):
+            co_eri_oovv_i = co_eri[i].transpose(1,0,2) - co_eri[i].transpose(1,2,0)
+            sumld_ic = lib.einsum('lcd,dl->c', co_eri_oovv_i, tmp)
+            sumjb_ia = lib.einsum('jab,jb->a', co_t2[i], tmp1)
+            term1_i = sumld_ic[:,None] * sumjb_ia[None,:] * co_ovlp_oo_inv[i]
+            term1 += numpy.einsum('ca,ca->', term1_i, S_ipr_matrix[i])
+
+            sumd_ijc = numpy.einsum('jcd,dj->jc', co_eri_oovv_i, co_ovlp_vo)
+            sumb_ija = numpy.einsum('jab,jb->ja', co_t2[i], co_ovlp_ov)
+            sumdb_jca = sumd_ijc[:,:,None] * sumb_ija[:,None,:]
+            Soo_ij = (co_ovlp_oo_inv * co_ovlp_oo_inv) * co_ovlp_oo_inv[i]
+            Soo_jca = Soo_ij[:,None,None] * S_ipr_matrix[i,None,:,:]
+            term2 -= numpy.einsum('jca,jca->', sumdb_jca, Soo_jca)
+
+        '''
         # 1st term.
         tmp = co_ovlp_vo * co_ovlp_oo_inv[None,:]
         sumld_ic = lib.einsum('ilcd,dl->ic', co_eri_oovv, tmp)
@@ -764,7 +850,7 @@ class SPPT2:
         tmp1 = (co_ovlp_oo_inv * co_ovlp_oo_inv)[None,:] * co_ovlp_oo_inv[:,None]
         tmp1 = tmp1[:,:,None,None] * S_ipr_matrix[:,None,:,:]
         term2 = -numpy.einsum('ijca,ijca->', tmp, tmp1)
-
+        '''
         return (term1 + term2) * numpy.prod(co_ovlp_oo_diag)
     
     def energy_01_term2_case3(self, co_t2, co_eri, co_ovlp, co_ovlp_oo_diag):
@@ -782,6 +868,26 @@ class SPPT2:
         co_ovlp_oo_inv2 = co_ovlp_oo_inv * co_ovlp_oo_inv
         co_ovlp_oo_inv_ij = co_ovlp_oo_inv[:,None] * co_ovlp_oo_inv[None,:]
 
+        sumklcd = sumijab = 0
+        term2 = 0
+        term3 = 0
+        for i in range(nocc):
+            co_eri_oovv_i = co_eri[i].transpose(1,0,2) - co_eri[i].transpose(1,2,0)
+            sumcd_ij = numpy.einsum('jcd,c,dj->j', co_eri_oovv_i, co_ovlp_vo[:,i], co_ovlp_vo)
+            sumab_ij = numpy.einsum('jab,a,jb->j', co_t2[i], co_ovlp_ov[i], co_ovlp_ov)
+
+            sumklcd += numpy.einsum('j,j->', sumcd_ij, co_ovlp_oo_inv_ij[i])
+            sumijab += numpy.einsum('j,j->', sumab_ij, co_ovlp_oo_inv_ij[i])
+
+            sumlcd_i = numpy.dot(sumcd_ij, co_ovlp_oo_inv)
+            sumjab_i = numpy.dot(sumab_ij, co_ovlp_oo_inv)
+            term2 -= sumlcd_i * sumjab_i * co_ovlp_oo_inv2[i]
+
+            term3 += 0.5 * numpy.sum(sumcd_ij * sumab_ij *
+                                     co_ovlp_oo_inv2[i] * co_ovlp_oo_inv2)
+        term1 = 0.25 * sumklcd * sumijab
+
+        '''
         sumcd_ij = numpy.einsum('ijcd,ci,dj->ij', co_eri_oovv, co_ovlp_vo, co_ovlp_vo)
         sumab_ij = numpy.einsum('ijab,ia,jb->ij', co_t2, co_ovlp_ov, co_ovlp_ov)
 
@@ -798,7 +904,7 @@ class SPPT2:
         # 3rd term.
         term3 = 0.5 * numpy.sum(sumcd_ij * sumab_ij * 
                                 co_ovlp_oo_inv2[:,None] * co_ovlp_oo_inv2[None,:])
-        
+        '''
         return (term1 + term2 + term3) * numpy.prod(co_ovlp_oo_diag)
     
     def energy_01_term2(self, co_t2, co_eri, co_ovlp, co_ovlp_oo_diag, verbose=False):
@@ -1020,58 +1126,23 @@ class SPPT2:
         mo_hcore = reduce(numpy.dot, (mo_coeff.conj().T, ao_hcore, mo_coeff))
         return mo_hcore
     
-    def get_ao_eri(self):
-        """
-        Computes the AO eris.
-        """
-        return self.mol.intor('int2e', aosym='s8')
-        
-    def get_mo_eri_complex(self, mo_coeff):
-        """
-        Transforms the AO eris to MO eris. For complex-valued mo_coeffs.
-        
-        Args
-            mo_coeff (ndarray): GHF mo_coeff
-            
-        Returns
-            mo_eri with shape (nmo, nmo, nmo, nmo)
-        """
-        if not isinstance(self.mo_eri, numpy.ndarray):
-            ao_eri = self.get_ao_eri()
-            moa = mo_coeff[:self.mol.nao]
-            mob = mo_coeff[self.mol.nao:]
-            self.mo_eri = ao2mo_slow(ao_eri, (moa,moa,moa,moa))
-            self.mo_eri += ao2mo_slow(ao_eri, (mob,mob,mob,mob))
-            self.mo_eri += ao2mo_slow(ao_eri, (moa,moa,mob,mob))
-            self.mo_eri += ao2mo_slow(ao_eri, (mob,mob,moa,moa))
-        
-        return self.mo_eri
-    
-    def get_mo_eri_real(self, mo_coeff):
-        """
-        Transforms the AO eris to MO eris. For real-valued mo_coeffs.
-        
-        Args
-            mo_coeff (ndarray): GHF mo_coeff
-            
-        Returns
-            mo_eri with shape (nmo, nmo, nmo, nmo)
-        """
-        if not isinstance(self.mo_eri, numpy.ndarray):
-            ao_eri = self.get_ao_eri()
-            nmo = self.nmo
-            moa = mo_coeff[:self.mol.nao]
-            mob = mo_coeff[self.mol.nao:]
-            self.mo_eri = ao2mo.kernel(ao_eri, (moa,moa,moa,moa), compact=False)
-            self.mo_eri += ao2mo.kernel(ao_eri, (mob,mob,mob,mob), compact=False)
-            self.mo_eri += ao2mo.kernel(ao_eri, (moa,moa,mob,mob), compact=False)
-            self.mo_eri += ao2mo.kernel(ao_eri, (mob,mob,moa,moa), compact=False)
-            self.mo_eri = self.mo_eri.reshape(nmo, nmo, nmo, nmo)
-            
-        return self.mo_eri
-
     def ao2mo(self, mo_coeff=None, nocc=None):
-        return _make_eris_incore(self, mo_coeff, nocc)
+        nmo = self.nmo
+        nocc = self.nocc
+        nvir = nmo - nocc
+        if mo_coeff is None:
+            dtype = self.mo_coeff.dtype
+        else:
+            dtype = mo_coeff.dtype
+        fac = 2 if dtype==numpy.complex else 1
+        #mo_eri, co_eri, co_t2
+        #FIXME need to consider temporary memory used
+        mem_incore = ((nocc*nmo)**2+2*(nocc*nvir)**2)*8*fac/1e6
+        mem_now = lib.current_memory()[0]
+        if (mem_incore+mem_now < self.max_memory or self.mol.incore_anyway):
+            return _make_eris_incore(self, mo_coeff, nocc)
+        else:
+            return _make_eris_outcore(self, mo_coeff, nocc)
 
     def get_co_coeff(self, mo_coeff, u):
         return numpy.dot(mo_coeff, u)
@@ -1083,16 +1154,30 @@ class SPPT2:
         if self.mo_eri is None:
             self.mo_eri = self.ao2mo(mo_coeff)
 
-        mo_eri_oovv = self.mo_eri.ovov.transpose(0,2,1,3)
-        co_eri_oovv = lib.einsum('pi,qj,pqab->ijab', u_oo.conj(), u_oo.conj(), mo_eri_oovv)
-        co_eri = co_eri_oovv.transpose(0,2,1,3)
+        u_oo_c = u_oo.conj()
+        eri_ovov = self.mo_eri.ovov
+        if isinstance(eri_ovov, numpy.memmap):
+            co_eri = _make_co_eris_outcore(self, mo_coeff, u_oo)
+        else:
+            mo_eri_oovv = eri_ovov.transpose(0,2,1,3)
+            co_eri_oovv = lib.einsum('pi,qj,pqab->ijab', u_oo_c, u_oo_c, mo_eri_oovv)
+            co_eri = co_eri_oovv.transpose(0,2,1,3)
         return co_eri
 
     def get_co_t2(self, mo_t2, v_oo):
         """
         CO t2 amplitudes derived from MO t2 amplitudes elucidated with Garnet's method.
         """
-        co_t2 = lib.einsum('pi,qj,pqab->ijab', v_oo, v_oo, mo_t2)
+        nocc = self.nocc
+        nmo = self.nmo
+        nvir = nmo - nocc
+        fac = 2 if mo_t2.dtype==numpy.complex else 1
+        mem_incore = (nocc*nvir)**2*8*fac/1e6
+        mem_now = lib.current_memory()[0]
+        if mem_incore+mem_now > self.max_memory*.9:
+            co_t2 = _make_co_t2_outcore(self, mo_t2, v_oo)
+        else:
+            co_t2 = lib.einsum('pi,qj,pqab->ijab', v_oo, v_oo, mo_t2)
         return co_t2
 
 # Other functions.
@@ -1168,7 +1253,7 @@ def get_all_doubles(mo_occ, nocc, nmo):
 
     return all_doubles
 
-def _ao2mo_loop(mp, eris):
+def _ao2mo_loop(mp, eris, max_memory=2000):
     mo_coeff = eris.mo_coeff
     nao = mo_coeff.shape[0]
     complex_orb = mo_coeff.dtype == numpy.complex
@@ -1194,12 +1279,9 @@ def _ao2mo_loop(mp, eris):
     with_df = mp.with_df
     naux = with_df.get_naoaux()
     mem_now = lib.current_memory()[0]
-    max_memory = max(2000, mp.max_memory*.95-mem_now)
-    fac = 1 if not complex_orb else 2
-    buf_size = max_memory*1e6/8 - (nocc*nmo)**2*fac
-    if buf_size < 0:
-        raise RuntimeError(f"At least {(nocc*nmo)**2*fac*8/1e9} Gb of memory is needed.")
-    blksize = int(min(naux, max(with_df.blockdim, buf_size / (4*nocc*nmo))))
+    buf_size = (max_memory-mem_now)*1e6/8
+    fac = 2 if not complex_orb else 8
+    blksize = int(min(naux, max(with_df.blockdim, buf_size / (fac*nocc*nmo))))
 
     for eri1 in with_df.loop(blksize=blksize):
         if complex_orb:
@@ -1225,24 +1307,167 @@ def _make_eris_incore(mp, mo_coeff=None, nocc=None):
     mo_coeff = eris.mo_coeff
     naux = mp.with_df.get_naoaux()
     nocc, nmo = eris.nocc, eris.nmo
+    buf = numpy.empty((nocc*nmo, nocc*nmo), dtype=mo_coeff.dtype)
 
+    mem_now = lib.current_memory()[0]
+    max_memory = max(2000, mp.max_memory-mem_now)
+
+    p1 = 0
+    for Lova, Lovb in _ao2mo_loop(mp, eris, max_memory=max_memory):
+        if p1 == 0:
+            buf = lib.dot(Lova.T, Lova, c=buf)
+        else:
+            buf = lib.dot(Lova.T, Lova, c=buf, beta=1)
+        buf = lib.dot(Lovb.T, Lovb, c=buf, beta=1)
+        buf = lib.dot(Lova.T, Lovb, c=buf, beta=1)
+        buf = lib.dot(Lovb.T, Lova, c=buf, beta=1)
+        p1 = p1+1
+
+    buf = buf.reshape(nocc, nmo, nocc, nmo)
+    eris.oooo = buf[:,:nocc,:,:nocc].copy()
+    eris.ooov = buf[:,:nocc,:,nocc:].copy()
+    eris.ovov = buf[:,nocc:,:,nocc:].copy()
+    buf = None
+    cput1 = logger.timer(mp, '_make_eris_incore', *cput0)
+    return eris
+
+def _make_eris_outcore(mp, mo_coeff=None, nocc=None):
+    cput0 = (logger.process_clock(), logger.perf_counter())
+    eris = _ChemistsERIs()
+    eris._common_init_(mp, mo_coeff, nocc)
+
+    mo_coeff = eris.mo_coeff
+    naux = mp.with_df.get_naoaux()
+    nocc, nmo = eris.nocc, eris.nmo
+    nvir = nmo - nocc
+    buf = numpy.empty((nmo, nocc*nmo), dtype=mo_coeff.dtype)
     Lova = numpy.empty((naux, nocc*nmo), dtype=mo_coeff.dtype)
     Lovb = numpy.empty((naux, nocc*nmo), dtype=mo_coeff.dtype)
 
+    filename = mp.mo_eri_file = tempfile.NamedTemporaryFile(dir=param.TMPDIR)
+    fp = numpy.memmap(filename, dtype=mo_coeff.dtype, mode='w+', shape=(nocc**4+nocc**3*nvir+nocc**2*nvir**2,))
+    mem_now = lib.current_memory()[0]
+    max_memory = max(2000, mp.max_memory-mem_now)
+
     p1 = 0
-    for qova, qovb in _ao2mo_loop(mp, eris):
+    for qova, qovb in _ao2mo_loop(mp, eris, max_memory=max_memory):
         p0, p1 = p1, p1 + qova.shape[0]
         Lova[p0:p1] = qova
         Lovb[p0:p1] = qovb
 
-    buf  = lib.dot(Lova.T, Lova)
-    buf += lib.dot(Lovb.T, Lovb)
-    buf += lib.dot(Lova.T, Lovb)
-    buf += lib.dot(Lovb.T, Lova)
-    eris.opop = buf.reshape(nocc, nmo, nocc, nmo)
-    eris.ovov = eris.opop[:,nocc:,:,nocc:]
-    cput1 = logger.timer(mp, '_make_eris_incore', *cput0)
+    itemsize = mo_coeff.itemsize
+    of_ooov = nocc**4
+    of_ovov = nocc**4 + nocc**3*nvir
+    for i in range(nocc):
+        buf = lib.dot(Lova.T[i*nmo:(i+1)*nmo], Lova, c=buf)
+        buf = lib.dot(Lovb.T[i*nmo:(i+1)*nmo], Lovb, c=buf, beta=1)
+        buf = lib.dot(Lova.T[i*nmo:(i+1)*nmo], Lovb, c=buf, beta=1)
+        buf = lib.dot(Lovb.T[i*nmo:(i+1)*nmo], Lova, c=buf, beta=1)
+        tmp = buf.reshape(nmo,nocc,nmo)
+        fp[i*nocc**3:(i+1)*nocc**3] = tmp[:nocc,:,:nocc].reshape(nocc**3)
+        fp.flush()
+        fp[of_ooov+i*nocc**2*nvir:of_ooov+(i+1)*nocc**2*nvir] = tmp[:nocc,:,nocc:].reshape(nocc**2*nvir)
+        fp.flush()
+        fp[of_ovov+i*nocc*nvir**2:of_ovov+(i+1)*nocc*nvir**2] = tmp[nocc:,:,nocc:].reshape(nocc*nvir**2)
+        fp.flush()
+
+    fp_oooo = numpy.memmap(filename, dtype=mo_coeff.dtype, mode='r', shape=(nocc,nocc,nocc,nocc))
+    fp_ooov = numpy.memmap(filename, dtype=mo_coeff.dtype, mode='r', shape=(nocc,nocc,nocc,nvir), offset=of_ooov*itemsize)
+    fp_ovov = numpy.memmap(filename, dtype=mo_coeff.dtype, mode='r', shape=(nocc,nvir,nocc,nvir), offset=of_ovov*itemsize)
+    eris.oooo = fp_oooo
+    eris.ooov = fp_ooov
+    eris.ovov = fp_ovov
+    cput1 = logger.timer(mp, '_make_eris_outcore', *cput0)
     return eris
+
+def _ao2co_loop(mp, mo_coeff, co, max_memory=2000):
+    nao = mo_coeff.shape[0]
+    complex_orb = mo_coeff.dtype == numpy.complex
+    nocc, nmo = co.shape[1], mo_coeff.shape[1]
+    nvir = nmo - nocc
+
+    coa = co[:nao//2]
+    cob = co[nao//2:]
+    moa = mo_coeff[:nao//2, nocc:]
+    mob = mo_coeff[nao//2:, nocc:]
+
+    if complex_orb:
+        moa_RR = numpy.concatenate((coa.real, moa.real), axis=1)
+        moa_II = numpy.concatenate((coa.imag, moa.imag), axis=1)
+        moa_RI = numpy.concatenate((coa.real, moa.imag), axis=1)
+        moa_IR = numpy.concatenate((coa.imag, moa.real), axis=1)
+
+        mob_RR = numpy.concatenate((cob.real, mob.real), axis=1)
+        mob_II = numpy.concatenate((cob.imag, mob.imag), axis=1)
+        mob_RI = numpy.concatenate((cob.real, mob.imag), axis=1)
+        mob_IR = numpy.concatenate((cob.imag, mob.real), axis=1)
+    else:
+        moa = numpy.concatenate((coa,moa), axis=1)
+        mob = numpy.concatenate((cob,mob), axis=1)
+
+    ijslice = (0, nocc, nocc, nmo)
+    Lova = Lovb = buf = None
+
+    with_df = mp.with_df
+    naux = with_df.get_naoaux()
+    mem_now = lib.current_memory()[0]
+    buf_size = (max_memory-mem_now)*1e6/8
+    fac = 2 if not complex_orb else 8
+    blksize = int(min(naux, max(with_df.blockdim, buf_size / (fac*nocc*nvir))))
+
+    for eri1 in with_df.loop(blksize=blksize):
+        if complex_orb:
+            Lova  = _ao2mo.nr_e2(eri1, moa_RR, ijslice, aosym='s2', out=Lova)
+            Lova += _ao2mo.nr_e2(eri1, moa_II, ijslice, aosym='s2', out=buf)
+            Lova += 1j * _ao2mo.nr_e2(eri1, moa_RI, ijslice, aosym='s2', out=buf)
+            Lova -= 1j * _ao2mo.nr_e2(eri1, moa_IR, ijslice, aosym='s2', out=buf)
+
+            Lovb  = _ao2mo.nr_e2(eri1, mob_RR, ijslice, aosym='s2', out=Lovb)
+            Lovb += _ao2mo.nr_e2(eri1, mob_II, ijslice, aosym='s2', out=buf)
+            Lovb += 1j * _ao2mo.nr_e2(eri1, mob_RI, ijslice, aosym='s2', out=buf)
+            Lovb -= 1j * _ao2mo.nr_e2(eri1, mob_IR, ijslice, aosym='s2', out=buf)
+        else:
+            Lova = _ao2mo.nr_e2(eri1, moa, ijslice, aosym='s2', out=Lova)
+            Lovb = _ao2mo.nr_e2(eri1, mob, ijslice, aosym='s2', out=Lovb)
+        yield Lova, Lovb
+
+def _make_co_eris_outcore(mp, mo_coeff=None, u_oo=1):
+    cput0 = (logger.process_clock(), logger.perf_counter())
+    if mo_coeff is None:
+        mo_coeff = mp.mo_coeff
+    nocc = mp.nocc
+    nmo = mp.nmo
+    nvir = nmo - nocc
+    co = numpy.dot(mo_coeff[:,:nocc], u_oo)
+
+    naux = mp.with_df.get_naoaux()
+    buf = numpy.empty((nvir, nocc*nvir), dtype=mo_coeff.dtype)
+    Lova = numpy.empty((naux, nocc*nvir), dtype=mo_coeff.dtype)
+    Lovb = numpy.empty((naux, nocc*nvir), dtype=mo_coeff.dtype)
+
+    filename = mp.co_eri_file = tempfile.NamedTemporaryFile(dir=param.TMPDIR)
+    fp = numpy.memmap(filename, dtype=mo_coeff.dtype, mode='w+', shape=(nocc**2*nvir**2))
+    mem_now = lib.current_memory()[0]
+    max_memory = max(2000, mp.max_memory-mem_now)
+
+    p1 = 0
+    for qova, qovb in _ao2co_loop(mp, mo_coeff, co, max_memory=max_memory):
+        p0, p1 = p1, p1 + qova.shape[0]
+        Lova[p0:p1] = qova
+        Lovb[p0:p1] = qovb
+
+    blksize = nocc*nvir**2
+    for i in range(nocc):
+        buf = lib.dot(Lova.T[i*nvir:(i+1)*nvir], Lova, c=buf)
+        buf = lib.dot(Lovb.T[i*nvir:(i+1)*nvir], Lovb, c=buf, beta=1)
+        buf = lib.dot(Lova.T[i*nvir:(i+1)*nvir], Lovb, c=buf, beta=1)
+        buf = lib.dot(Lovb.T[i*nvir:(i+1)*nvir], Lova, c=buf, beta=1)
+        fp[i*blksize:(i+1)*blksize] = buf.ravel()
+        fp.flush()
+
+    co_eri = numpy.memmap(filename, dtype=mo_coeff.dtype, mode='r', shape=(nocc,nvir,nocc,nvir))
+    cput1 = logger.timer(mp, '_make_co_eris_outcore', *cput0)
+    return co_eri
 
 class _ChemistsERIs:
     def __init__(self, mol=None):
@@ -1251,8 +1476,9 @@ class _ChemistsERIs:
         self.nocc = None
         self.nmo = None
         #self.orbspin = None
+        self.oooo = None
+        self.ooov = None
         self.ovov = None
-        self.opop = None
 
     def _common_init_(self, mp, mo_coeff=None, nocc=None):
         if mo_coeff is None:
@@ -1269,6 +1495,21 @@ class _ChemistsERIs:
         self.nocc = nocc
         return self
 
+def _make_co_t2_outcore(mp, t2, v_oo):
+    nocc = mp.nocc
+    nmo = mp.nmo
+    nvir = nmo - nocc
+
+    filename = mp.co_t2_file = tempfile.NamedTemporaryFile(dir=param.TMPDIR)
+    fp = numpy.memmap(filename, dtype=t2.dtype, mode='w+', shape=(nocc**2*nvir**2))
+
+    v_oo_T = numpy.asarray(v_oo.T, order='C')
+    blksize = nocc*nvir**2
+    for i in range(nocc):
+        fp[i*blksize:(i+1)*blksize] = lib.einsum('p,qj,pqab->jab', v_oo_T[i], v_oo, t2).ravel()
+
+    co_t2 = numpy.memmap(filename, dtype=t2.dtype, mode='r', shape=(nocc,nocc,nvir,nvir))
+    return co_t2
 
 if __name__ == '__main__':
     from pyscf import fci
