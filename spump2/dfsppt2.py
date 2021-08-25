@@ -7,6 +7,9 @@ V13
         - But calculating MO eris without df.
         
     - Optimize with einsum.
+
+Reference:
+    1. J. Chem. Phys. 139, 174104 (2013)
 """
 
 from functools import reduce
@@ -73,6 +76,7 @@ class SPPT2:
         self.nelec = self.mol.nelectron
         self.nocc = self.nelec
         self.nmo = 2 * self.mol.nao # Number of spatial MOs.
+        self.frozen = None
         self.S = self.mol.spin / 2 # mol.spin = n_alpha - n_beta
         self.e_tot = None
         self.e_hf = None
@@ -588,347 +592,73 @@ class SPPT2:
             return co_ovlp, co_ovlp_oo_diag, u_oo, v_oo
         return co_ovlp
  
-    def energy_01_term1(self, mo_coeff1, mo_coeff2, mo_occ, co_t2):
-        """
-        Computes E_{HF} * sum_{i<j, a<b} [ t_{ijab} * <Psi_{UHF} | R | {Psi_{UHF}}_{ij}^{ab}> ] using Eq. 14
-        from J. Chem. Phys. 139, 174104 (2013).
-        
-        - No CO transformation for vv block.
-        """
-        nmo = self.nmo
-        nocc = self.nelec
-        nvir = nmo - nocc
-        
-        # Get the U, S, V matrices.
-        u_oo, co_ovlp_oo_diag, v_oo = self.get_co_ovlp_oo(mo_coeff1, mo_coeff2)
-        
-        # Get the ov-block of the CO overlap matrix.
-        co_ovlp_ov = self.get_co_ovlp_ov(mo_coeff1, mo_coeff2, u_oo)
-        
-        # Get inverse of the oo-block of the CO overlap matrix.
-        co_ovlp_oo_inv = 1. / co_ovlp_oo_diag
-        
-        prefactor = 0.5 * self.e_elec_hf * numpy.prod(co_ovlp_oo_diag)
-
-        term = 0
-        tmp = co_ovlp_ov * co_ovlp_oo_inv[:,None]
-        for i in range(nocc):
-            co_t2_i = numpy.asarray(co_t2[i])
-            term += lib.einsum('jab,a,jb->', co_t2_i, tmp[i], tmp)
-        #term = lib.einsum('ijab,ia,jb->', co_t2, tmp, tmp)
-        return prefactor * term 
-        
-    def get_S_ijpr_matrix_slow(self, co_ovlp, co_ovlp_oo_diag):
-        """
-        Constructs the S_ijpr tensor used in the evaluation of <Psi_{UHF}|H R|Psi_{UHF}^{1}>.
-        """
-        nocc = self.nocc
-        nvir = self.nmo - nocc
-        S_ijpr_mat = numpy.empty((nocc, nocc, nvir, nvir))
-        
-        for i in range(nocc):
-            for j in range(nocc):
-                inds = (i, j)
-                _nocc = nocc - len(numpy.unique(inds))
-                co_ovlp_ij = numpy.delete(co_ovlp, inds, axis=0) # Delete rows i, j
-                co_ovlp_ij = numpy.delete(co_ovlp_ij, inds, axis=1) # Delete cols i, j
-                co_ovlp_ov_ij = co_ovlp_ij[:_nocc, _nocc:]
-                co_ovlp_vo_ij = co_ovlp_ij[_nocc:, :_nocc]
-
-                co_ovlp_oo_diag_ij = numpy.delete(co_ovlp_oo_diag, inds, axis=0) # Delete elements i, j
-                co_ovlp_oo_inv_ij = 1. / co_ovlp_oo_diag_ij
-                
-                # [ co_ovlp_ij.T ]_{pk} = [ co_ovlp_ij ]_{kp}
-                S_ijpr_mat[i, j] = (co_ovlp[nocc:, nocc:] - 
-                                    numpy.einsum('pk,k,kr->pr', co_ovlp_vo_ij, co_ovlp_oo_inv_ij, co_ovlp_ov_ij))
-        
-        return S_ijpr_mat
-
     def get_S_ijpr_matrix(self, co_ovlp, co_ovlp_oo_diag):
         """
         Constructs the S_ijpr tensor used in the evaluation of <Psi_{UHF}|H R|Psi_{UHF}^{1}>.
         """
         nocc = self.nocc
         nvir = self.nmo - nocc
+        i0 = 0
+        if self.frozen:
+            i0 = self.frozen
 
         co_ovlp_vv = co_ovlp[nocc:,nocc:]
         co_ovlp_ov = co_ovlp[:nocc,nocc:]
         co_ovlp_vo = co_ovlp[nocc:,:nocc]
         co_ovlp_oo_inv = 1. / co_ovlp_oo_diag
+
         #S_ipr = numpy.einsum("pk,kr,k->kpr", co_ovlp_vo, co_ovlp_ov, co_ovlp_oo_inv)
-        S_ipr = co_ovlp_vo.T[:,:,None] * co_ovlp_ov[:,None,:] * co_ovlp_oo_inv[:,None,None]
+        S_ipr = co_ovlp_vo.T[i0:,:,None] * co_ovlp_ov[i0:,None,:] * co_ovlp_oo_inv[i0:,None,None]
         S_pr = numpy.sum(S_ipr, axis=0)
 
         tmp = co_ovlp_vv - S_pr
         tmp1 = S_ipr[:,None,:,:] + S_ipr[None,:,:,:]
-        idx = numpy.arange(nocc, dtype=numpy.intp)
+        idx = numpy.arange(nocc-i0, dtype=numpy.intp)
         tmp1[idx,idx,:,:] *= .5
         S_ijpr_mat = tmp[None,None,:,:] + tmp1
         return S_ijpr_mat
 
-    def get_S_ijpr_matrix_i(self, co_ovlp, co_ovlp_oo_diag):
+    def get_S_ijpr_matrix_i(self, co_ovlp, co_ovlp_oo_diag, index=0, frozen=None):
         nocc = self.nocc
         nvir = self.nmo - nocc
+        i0 = frozen if frozen else 0
 
         co_ovlp_vv = co_ovlp[nocc:,nocc:]
         co_ovlp_ov = co_ovlp[:nocc,nocc:]
         co_ovlp_vo = co_ovlp[nocc:,:nocc]
         co_ovlp_oo_inv = 1. / co_ovlp_oo_diag
+
         #S_ipr = numpy.einsum("pk,kr,k->kpr", co_ovlp_vo, co_ovlp_ov, co_ovlp_oo_inv)
-        S_ipr = co_ovlp_vo.T[:,:,None] * co_ovlp_ov[:,None,:] * co_ovlp_oo_inv[:,None,None]
+        S_ipr = co_ovlp_vo.T[i0:,:,None] * co_ovlp_ov[i0:,None,:] * co_ovlp_oo_inv[i0:,None,None]
         S_pr = numpy.sum(S_ipr, axis=0)
 
         tmp = co_ovlp_vv - S_pr
-        for i in range(nocc):
-            tmp1 = S_ipr[i,None,:,:] + S_ipr
-            tmp1[i,:,:] *= .5
-            S_ijpr_mat = tmp[None,:,:] + tmp1
-            yield S_ijpr_mat
+        tmp1 = S_ipr[index,None,:,:] + S_ipr
+        tmp1[index,:,:] *= .5
+        S_ijpr_mat = tmp[None,:,:] + tmp1
+        return S_ijpr_mat
 
-    def get_S_ipr_matrix_slow(self, co_ovlp, co_ovlp_oo_diag):
-        """
-        Constructs the S_ipr tensor used in the evaluation of <Psi_{UHF}|H R|Psi_{UHF}^{1}>.
-        """
-        nocc = self.nocc
-        _nocc = nocc - 1
-        nvir = self.nmo - nocc
-        S_ipr_mat = numpy.empty((nocc, nvir, nvir))
-        
-        for i in range(nocc):
-            co_ovlp_i = numpy.delete(co_ovlp, i, axis=0) # Delete row i
-            co_ovlp_i = numpy.delete(co_ovlp_i, i, axis=1) # Delete col i
-            co_ovlp_ov_i = co_ovlp_i[:_nocc, _nocc:]
-            co_ovlp_vo_i = co_ovlp_i[_nocc:, :_nocc]
-
-            co_ovlp_oo_diag_i = numpy.delete(co_ovlp_oo_diag, i, axis=0) # Delete element i
-            co_ovlp_oo_inv_i = 1. / co_ovlp_oo_diag_i
-            
-            # [ co_ovlp_i.T ]_{pk} = [ co_ovlp_i ]_{kp}
-            S_ipr_mat[i] = (co_ovlp[nocc:, nocc:] - 
-                           numpy.einsum('pk,k,kr->pr', co_ovlp_vo_i, co_ovlp_oo_inv_i, co_ovlp_ov_i))
-        
-        return S_ipr_mat
-
-    def get_S_ipr_matrix(self, co_ovlp, co_ovlp_oo_diag):
+    def get_S_ipr_matrix(self, co_ovlp, co_ovlp_oo_diag, frozen=None):
         """
         Constructs the S_ipr tensor used in the evaluation of <Psi_{UHF}|H R|Psi_{UHF}^{1}>.
         """
         nocc = self.nocc
         nvir = self.nmo - nocc
+        i0 = frozen if frozen else 0
 
         co_ovlp_vv = co_ovlp[nocc:,nocc:]
         co_ovlp_ov = co_ovlp[:nocc,nocc:]
         co_ovlp_vo = co_ovlp[nocc:,:nocc]
         co_ovlp_oo_inv = 1. / co_ovlp_oo_diag
+
         #S_ipr = numpy.einsum("pk,kr,k->kpr", co_ovlp_vo, co_ovlp_ov, co_ovlp_oo_inv)
-        S_ipr = co_ovlp_vo.T[:,:,None] * co_ovlp_ov[:,None,:] * co_ovlp_oo_inv[:,None,None]
+        S_ipr = co_ovlp_vo.T[i0:,:,None] * co_ovlp_ov[i0:,None,:] * co_ovlp_oo_inv[i0:,None,None]
         S_pr = numpy.sum(S_ipr, axis=0)
 
         tmp = co_ovlp_vv - S_pr
         S_ipr_mat = tmp[None,:,:] + S_ipr
         return S_ipr_mat
 
-    def energy_01_term2_case1(self, co_t2, co_eri, co_ovlp, co_ovlp_oo_diag):
-        """
-        Case 1: i = k, j = l
-        """
-        nocc = self.nocc
-        nmo = self.nmo
-        nvir = nmo - nocc
-        #co_eri_oovv = co_eri.transpose(0,2,1,3) - co_eri.transpose(0,2,3,1)
-        co_ovlp_oo_inv = 1. / co_ovlp_oo_diag
-        Sij_inv = co_ovlp_oo_inv[:,None]*co_ovlp_oo_inv[None,:]
-
-        sumadij = 0
-        sumc_ijad = numpy.empty((nocc,nvir,nvir), order='C', dtype=co_ovlp.dtype)
-        sumb_ijad = numpy.empty((nocc,nvir,nvir), order='C', dtype=co_ovlp.dtype)
-        for i, S_ijpr_matrix_i in enumerate(self.get_S_ijpr_matrix_i(co_ovlp, co_ovlp_oo_diag)):
-            S_ijpr_matrix_i = numpy.asarray(S_ijpr_matrix_i, order='C')
-            co_eri_i = numpy.asarray(co_eri[i])
-            co_eri_oovv_i = co_eri_i.transpose(1,0,2) - co_eri_i.transpose(1,2,0)
-            co_eri_oovv_i = numpy.asarray(co_eri_oovv_i, order='C')
-            co_t2_i = numpy.asarray(co_t2[i], order='C')
-
-            if co_ovlp.dtype == numpy.double:
-                fn = getattr(libnp_helper, "contract_o2v3_i", None)
-            elif co_ovlp.dtype == numpy.complex:
-                fn = getattr(libnp_helper, "contract_o2v3_i_cmplx", None)
-
-            try:
-                case0 = 0
-                case1 = 1
-                fn(sumc_ijad.ctypes.data_as(ctypes.c_void_p),
-                   S_ijpr_matrix_i.ctypes.data_as(ctypes.c_void_p),
-                   co_eri_oovv_i.ctypes.data_as(ctypes.c_void_p),
-                   ctypes.c_int(nocc), ctypes.c_int(nvir), ctypes.c_int(case0))
-                fn(sumb_ijad.ctypes.data_as(ctypes.c_void_p),
-                   co_t2_i.ctypes.data_as(ctypes.c_void_p),
-                   S_ijpr_matrix_i.ctypes.data_as(ctypes.c_void_p),
-                   ctypes.c_int(nocc), ctypes.c_int(nvir), ctypes.c_int(case1))
-            except:
-                raise RuntimeError
-
-            tmp = sumb_ijad * Sij_inv[i,:,None,None]
-            sumadij += lib.einsum('jad,jad->', sumc_ijad, tmp)
-
-        '''
-        S_ijpr_matrix = self.get_S_ijpr_matrix(co_ovlp, co_ovlp_oo_diag)
-        S_ijpr_matrix = numpy.asarray(S_ijpr_matrix, order='C')
-        co_t2 = numpy.asarray(co_t2, order='C')
-        sumc_ijad = numpy.empty((nocc,nocc,nvir,nvir), order='C', dtype=co_ovlp.dtype)
-        sumb_ijad = numpy.empty((nocc,nocc,nvir,nvir), order='C', dtype=co_ovlp.dtype)
-        #for i in range(nocc):
-        #    sumc_ijad[i] = numpy.einsum('jca,jcd->jad', S_ijpr_matrix[i], co_eri_oovv[i])
-        #    sumb_ijad[i] = numpy.einsum('jab,jdb->jad', co_t2[i], S_ijpr_matrix[i])
-
-        if co_ovlp.dtype == numpy.double:
-            fn = getattr(libnp_helper, "contract_o2v3", None)
-        elif co_ovlp.dtype == numpy.complex:
-            fn = getattr(libnp_helper, "contract_o2v3_cmplx", None)
-        try:
-            case0 = 0
-            case1 = 1
-            fn(sumc_ijad.ctypes.data_as(ctypes.c_void_p), 
-               S_ijpr_matrix.ctypes.data_as(ctypes.c_void_p), 
-               co_eri_oovv.ctypes.data_as(ctypes.c_void_p), 
-               ctypes.c_int(nocc), ctypes.c_int(nvir), ctypes.c_int(case0))
-            fn(sumb_ijad.ctypes.data_as(ctypes.c_void_p), 
-               co_t2.ctypes.data_as(ctypes.c_void_p),
-               S_ijpr_matrix.ctypes.data_as(ctypes.c_void_p),
-               ctypes.c_int(nocc), ctypes.c_int(nvir), ctypes.c_int(case1))
-        except:
-            raise RuntimeError
-
-        Sij_inv = co_ovlp_oo_inv[:,None]*co_ovlp_oo_inv[None,:]
-        tmp = sumb_ijad * Sij_inv[:,:,None,None]
-        sumadij = lib.einsum('ijad,ijad->', sumc_ijad, tmp)
-        '''
-        return sumadij * 0.25 * numpy.prod(co_ovlp_oo_diag)
-    
-    def energy_01_term2_case2(self, co_t2, co_eri, co_ovlp, co_ovlp_oo_diag):
-        """
-        Case 2: i = k, j != l
-        """
-        nocc = self.nocc
-        nmo = self.nmo
-        nvir = nmo - nocc
-        #co_eri_oovv = co_eri.transpose(0,2,1,3) - co_eri.transpose(0,2,3,1)
-        co_ovlp_oo_inv = 1. / co_ovlp_oo_diag
-        co_ovlp_vo = co_ovlp[nocc:, :nocc]
-        co_ovlp_ov = co_ovlp[:nocc, nocc:]
-
-        S_ipr_matrix = self.get_S_ipr_matrix(co_ovlp, co_ovlp_oo_diag)
-
-        term1 = 0
-        term2 = 0
-
-        tmp = co_ovlp_vo * co_ovlp_oo_inv[None,:]
-        tmp1 = co_ovlp_ov * co_ovlp_oo_inv[:,None]
-        for i in range(nocc):
-            co_eri_i = numpy.asarray(co_eri[i])
-            co_t2_i = numpy.asarray(co_t2[i])
-            co_eri_oovv_i = co_eri_i.transpose(1,0,2) - co_eri_i.transpose(1,2,0)
-            sumld_ic = lib.einsum('lcd,dl->c', co_eri_oovv_i, tmp)
-            sumjb_ia = lib.einsum('jab,jb->a', co_t2_i, tmp1)
-            term1_i = sumld_ic[:,None] * sumjb_ia[None,:] * co_ovlp_oo_inv[i]
-            term1 += numpy.einsum('ca,ca->', term1_i, S_ipr_matrix[i])
-
-            sumd_ijc = numpy.einsum('jcd,dj->jc', co_eri_oovv_i, co_ovlp_vo)
-            sumb_ija = numpy.einsum('jab,jb->ja', co_t2_i, co_ovlp_ov)
-            sumdb_jca = sumd_ijc[:,:,None] * sumb_ija[:,None,:]
-            Soo_ij = (co_ovlp_oo_inv * co_ovlp_oo_inv) * co_ovlp_oo_inv[i]
-            Soo_jca = Soo_ij[:,None,None] * S_ipr_matrix[i,None,:,:]
-            term2 -= numpy.einsum('jca,jca->', sumdb_jca, Soo_jca)
-
-        '''
-        # 1st term.
-        tmp = co_ovlp_vo * co_ovlp_oo_inv[None,:]
-        sumld_ic = lib.einsum('ilcd,dl->ic', co_eri_oovv, tmp)
-        tmp = co_ovlp_ov * co_ovlp_oo_inv[:,None]
-        sumjb_ia = lib.einsum('ijab,jb->ia', co_t2, tmp)
-        tmp = sumld_ic[:,:,None] * sumjb_ia[:,None,:] * co_ovlp_oo_inv[:,None,None]
-        term1 = numpy.einsum('ica,ica->', tmp, S_ipr_matrix)
-
-        # 2nd term.
-        sumd_ijc = numpy.einsum('ijcd,dj->ijc', co_eri_oovv, co_ovlp_vo)
-        sumb_ija = numpy.einsum('ijab,jb->ija', co_t2, co_ovlp_ov)
-
-        tmp = sumd_ijc[:,:,:,None] * sumb_ija[:,:,None,:]
-        tmp1 = (co_ovlp_oo_inv * co_ovlp_oo_inv)[None,:] * co_ovlp_oo_inv[:,None]
-        tmp1 = tmp1[:,:,None,None] * S_ipr_matrix[:,None,:,:]
-        term2 = -numpy.einsum('ijca,ijca->', tmp, tmp1)
-        '''
-        return (term1 + term2) * numpy.prod(co_ovlp_oo_diag)
-    
-    def energy_01_term2_case3(self, co_t2, co_eri, co_ovlp, co_ovlp_oo_diag):
-        """
-        Case 3: i != k, j != l
-        """
-        nocc = self.nocc
-        nmo = self.nmo
-        nvir = nmo - nocc
-        #co_eri_oovv = co_eri.transpose(0,2,1,3) - co_eri.transpose(0,2,3,1)
-        co_ovlp_oo_inv = 1. / co_ovlp_oo_diag
-        co_ovlp_vo = co_ovlp[nocc:, :nocc]
-        co_ovlp_ov = co_ovlp[:nocc, nocc:]
-
-        co_ovlp_oo_inv2 = co_ovlp_oo_inv * co_ovlp_oo_inv
-        co_ovlp_oo_inv_ij = co_ovlp_oo_inv[:,None] * co_ovlp_oo_inv[None,:]
-
-        sumklcd = sumijab = 0
-        term2 = 0
-        term3 = 0
-        for i in range(nocc):
-            co_eri_i = numpy.asarray(co_eri[i])
-            co_t2_i = numpy.asarray(co_t2[i])
-            co_eri_oovv_i = co_eri_i.transpose(1,0,2) - co_eri_i.transpose(1,2,0)
-            sumcd_ij = numpy.einsum('jcd,c,dj->j', co_eri_oovv_i, co_ovlp_vo[:,i], co_ovlp_vo)
-            sumab_ij = numpy.einsum('jab,a,jb->j', co_t2_i, co_ovlp_ov[i], co_ovlp_ov)
-
-            sumklcd += numpy.einsum('j,j->', sumcd_ij, co_ovlp_oo_inv_ij[i])
-            sumijab += numpy.einsum('j,j->', sumab_ij, co_ovlp_oo_inv_ij[i])
-
-            sumlcd_i = numpy.dot(sumcd_ij, co_ovlp_oo_inv)
-            sumjab_i = numpy.dot(sumab_ij, co_ovlp_oo_inv)
-            term2 -= sumlcd_i * sumjab_i * co_ovlp_oo_inv2[i]
-
-            term3 += 0.5 * numpy.sum(sumcd_ij * sumab_ij *
-                                     co_ovlp_oo_inv2[i] * co_ovlp_oo_inv2)
-        term1 = 0.25 * sumklcd * sumijab
-
-        '''
-        sumcd_ij = numpy.einsum('ijcd,ci,dj->ij', co_eri_oovv, co_ovlp_vo, co_ovlp_vo)
-        sumab_ij = numpy.einsum('ijab,ia,jb->ij', co_t2, co_ovlp_ov, co_ovlp_ov)
-
-        # 1st term.
-        sumklcd = numpy.sum(sumcd_ij * co_ovlp_oo_inv_ij)
-        sumijab = numpy.sum(sumab_ij * co_ovlp_oo_inv_ij)
-        term1 = 0.25 * sumklcd * sumijab
-        
-        # 2nd term.
-        sumlcd_i = numpy.dot(sumcd_ij, co_ovlp_oo_inv)
-        sumjab_i = numpy.dot(sumab_ij, co_ovlp_oo_inv)
-        term2 = -numpy.sum(sumlcd_i * sumjab_i * co_ovlp_oo_inv2)
-        
-        # 3rd term.
-        term3 = 0.5 * numpy.sum(sumcd_ij * sumab_ij * 
-                                co_ovlp_oo_inv2[:,None] * co_ovlp_oo_inv2[None,:])
-        '''
-        return (term1 + term2 + term3) * numpy.prod(co_ovlp_oo_diag)
-    
-    def energy_01_term2(self, co_t2, co_eri, co_ovlp, co_ovlp_oo_diag, verbose=False):
-        case1 = self.energy_01_term2_case1(co_t2, co_eri, co_ovlp, co_ovlp_oo_diag)
-        case2 = self.energy_01_term2_case2(co_t2, co_eri, co_ovlp, co_ovlp_oo_diag)
-        case3 = self.energy_01_term2_case3(co_t2, co_eri, co_ovlp, co_ovlp_oo_diag)
-        term = case1 + case2 + case3
-                
-        if verbose:
-            print(f'case1 = {case1}')
-            print(f'case2 = {case2}')
-            print(f'case3 = {case3}')
-            
-        return term
-    
     def energy_01(self, ump2, mo_coeff2):
         """
         - No CO transformation for vv block.
@@ -948,12 +678,7 @@ class SPPT2:
         co_t2 = self.get_co_t2(mo_t2, v_oo)
         co_eri = self.get_co_eri_from_mo_eri(mo_coeff1, u_oo)
         
-        #term1 = self.energy_01_term1(mo_coeff1, mo_coeff2, mo_occ, co_t2)
-        #term2 = self.energy_01_term2(co_t2, co_eri, co_ovlp, co_ovlp_oo_diag)
-        #norm_01 = term1 / self.e_elec_hf
-       
         e, norm_01 = self.energy_01_term12(co_eri, co_t2, co_ovlp, co_ovlp_oo_diag, mo_coeff1, mo_coeff2, mo_occ)
-
         return e, norm_01
 
     def energy_01_term12(self, co_eri, co_t2, co_ovlp, co_ovlp_oo_diag, mo_coeff1, mo_coeff2, mo_occ):
@@ -961,6 +686,7 @@ class SPPT2:
         nmo = self.nmo
         nocc = self.nocc
         nvir = nmo - nocc
+        i0 = self.frozen if self.frozen else 0
 
         complex_orb = co_ovlp.dtype==numpy.complex
 
@@ -979,10 +705,10 @@ class SPPT2:
         S_vo_oo = co_ovlp_vo * co_ovlp_oo_inv[None,:]
         Sij_inv = co_ovlp_oo_inv[:,None]*co_ovlp_oo_inv[None,:]
 
-        sumc_ijad = numpy.empty((nocc,nvir,nvir), order='C', dtype=co_ovlp.dtype)
-        sumb_ijad = numpy.empty((nocc,nvir,nvir), order='C', dtype=co_ovlp.dtype)
+        sumc_ijad = numpy.empty((nocc-i0,nvir,nvir), order='C', dtype=co_ovlp.dtype)
+        sumb_ijad = numpy.empty((nocc-i0,nvir,nvir), order='C', dtype=co_ovlp.dtype)
 
-        S_ipr_matrix = self.get_S_ipr_matrix(co_ovlp, co_ovlp_oo_diag)
+        S_ipr_matrix = self.get_S_ipr_matrix(co_ovlp, co_ovlp_oo_diag, frozen=self.frozen)
 
         co_ovlp_oo_inv2 = co_ovlp_oo_inv * co_ovlp_oo_inv
         co_ovlp_oo_inv_ij = co_ovlp_oo_inv[:,None] * co_ovlp_oo_inv[None,:]
@@ -992,61 +718,68 @@ class SPPT2:
         term2_case2 = 0
         term2_case3 = 0
         sumklcd = sumijab = 0
-        for i, S_ijpr_matrix_i in enumerate(self.get_S_ijpr_matrix_i(co_ovlp, co_ovlp_oo_diag)):
-            co_t2_i = numpy.asarray(co_t2[i], order='C')
+
+        # NOTE i loops over all occupied orbitals
+        for i in range(nocc):
             co_eri_i = numpy.asarray(co_eri[i])
             co_eri_oovv_i = co_eri_i.transpose(1,0,2) - co_eri_i.transpose(1,2,0)
-            co_eri_oovv_i = numpy.asarray(co_eri_oovv_i, order='C')
-
-            term1 += lib.einsum('jab,a,jb->', co_t2_i, S_ov_oo[i], S_ov_oo)
-       
-            # case1
-            S_ijpr_matrix_i = numpy.asarray(S_ijpr_matrix_i, order='C')
-            if not complex_orb:
-                fn = getattr(libnp_helper, "contract_o2v3_i", None)
-            else:
-                fn = getattr(libnp_helper, "contract_o2v3_i_cmplx", None)
-
-            try:
-                case0 = 0
-                case1 = 1
-                fn(sumc_ijad.ctypes.data_as(ctypes.c_void_p),
-                   S_ijpr_matrix_i.ctypes.data_as(ctypes.c_void_p),
-                   co_eri_oovv_i.ctypes.data_as(ctypes.c_void_p),
-                   ctypes.c_int(nocc), ctypes.c_int(nvir), ctypes.c_int(case0))
-                fn(sumb_ijad.ctypes.data_as(ctypes.c_void_p),
-                   co_t2_i.ctypes.data_as(ctypes.c_void_p),
-                   S_ijpr_matrix_i.ctypes.data_as(ctypes.c_void_p),
-                   ctypes.c_int(nocc), ctypes.c_int(nvir), ctypes.c_int(case1))
-            except:
-                raise RuntimeError
-            tmp = sumb_ijad * Sij_inv[i,:,None,None]
-            term2_case1 += lib.einsum('jad,jad->', sumc_ijad, tmp)
-
-            # case2
-            sumld_ic = lib.einsum('lcd,dl->c', co_eri_oovv_i, S_vo_oo)
-            sumjb_ia = lib.einsum('jab,jb->a', co_t2_i, S_ov_oo)
-            tmp = sumld_ic[:,None] * sumjb_ia[None,:] * co_ovlp_oo_inv[i]
-            term2_case2 += numpy.einsum('ca,ca->', tmp, S_ipr_matrix[i])
-
-            sumd_ijc = numpy.einsum('jcd,dj->jc', co_eri_oovv_i, co_ovlp_vo)
-            sumb_ija = numpy.einsum('jab,jb->ja', co_t2_i, co_ovlp_ov)
-            sumdb_jca = sumd_ijc[:,:,None] * sumb_ija[:,None,:]
-            Soo_ij = (co_ovlp_oo_inv * co_ovlp_oo_inv) * co_ovlp_oo_inv[i]
-            Soo_jca = Soo_ij[:,None,None] * S_ipr_matrix[i,None,:,:]
-            term2_case2 -= numpy.einsum('jca,jca->', sumdb_jca, Soo_jca)
-
-            # case3
             sumcd_ij = numpy.einsum('jcd,c,dj->j', co_eri_oovv_i, co_ovlp_vo[:,i], co_ovlp_vo)
-            sumab_ij = numpy.einsum('jab,a,jb->j', co_t2_i, co_ovlp_ov[i], co_ovlp_ov)
             sumklcd += numpy.einsum('j,j->', sumcd_ij, co_ovlp_oo_inv_ij[i])
-            sumijab += numpy.einsum('j,j->', sumab_ij, co_ovlp_oo_inv_ij[i])
 
-            sumlcd_i = numpy.dot(sumcd_ij, co_ovlp_oo_inv)
-            sumjab_i = numpy.dot(sumab_ij, co_ovlp_oo_inv)
-            term2_case3 -= sumlcd_i * sumjab_i * co_ovlp_oo_inv2[i]
-            term2_case3 += 0.5 * numpy.sum(sumcd_ij * sumab_ij *
-                                           co_ovlp_oo_inv2[i] * co_ovlp_oo_inv2)
+            if i >= i0:
+                co_t2_i = numpy.asarray(co_t2[i-i0], order='C')
+                term1 += lib.einsum('jab,a,jb->', co_t2_i, S_ov_oo[i], S_ov_oo[i0:])
+
+                co_eri_oovv_ij = numpy.asarray(co_eri_oovv_i[i0:].copy(), order='C')
+
+                # case1
+                S_ijpr_matrix_i = self.get_S_ijpr_matrix_i(co_ovlp, co_ovlp_oo_diag, 
+                                                           index=i-i0, frozen=self.frozen)
+                S_ijpr_matrix_i = numpy.asarray(S_ijpr_matrix_i, order='C')
+                if not complex_orb:
+                    fn = getattr(libnp_helper, "contract_o2v3_i", None)
+                else:
+                    fn = getattr(libnp_helper, "contract_o2v3_i_cmplx", None)
+
+                try:
+                    case0 = 0
+                    case1 = 1
+                    fn(sumc_ijad.ctypes.data_as(ctypes.c_void_p),
+                       S_ijpr_matrix_i.ctypes.data_as(ctypes.c_void_p),
+                       co_eri_oovv_ij.ctypes.data_as(ctypes.c_void_p),
+                       ctypes.c_int(nocc-i0), ctypes.c_int(nvir), ctypes.c_int(case0))
+                    fn(sumb_ijad.ctypes.data_as(ctypes.c_void_p),
+                       co_t2_i.ctypes.data_as(ctypes.c_void_p),
+                       S_ijpr_matrix_i.ctypes.data_as(ctypes.c_void_p),
+                       ctypes.c_int(nocc-i0), ctypes.c_int(nvir), ctypes.c_int(case1))
+                except:
+                    raise RuntimeError
+                tmp = sumb_ijad * Sij_inv[i,i0:,None,None]
+                term2_case1 += lib.einsum('jad,jad->', sumc_ijad, tmp)
+
+                # case2
+                sumld_ic = lib.einsum('lcd,dl->c', co_eri_oovv_i, S_vo_oo)
+                sumjb_ia = lib.einsum('jab,jb->a', co_t2_i, S_ov_oo[i0:])
+                tmp = sumld_ic[:,None] * sumjb_ia[None,:] * co_ovlp_oo_inv[i]
+                term2_case2 += numpy.einsum('ca,ca->', tmp, S_ipr_matrix[i-i0])
+
+                sumd_ijc = numpy.einsum('jcd,dj->jc', co_eri_oovv_ij, co_ovlp_vo[:,i0:])
+                sumb_ija = numpy.einsum('jab,jb->ja', co_t2_i, co_ovlp_ov[i0:])
+                sumdb_jca = sumd_ijc[:,:,None] * sumb_ija[:,None,:]
+                Soo_ij = (co_ovlp_oo_inv[i0:] * co_ovlp_oo_inv[i0:]) * co_ovlp_oo_inv[i]
+                Soo_jca = Soo_ij[:,None,None] * S_ipr_matrix[i-i0,None,:,:]
+                term2_case2 -= numpy.einsum('jca,jca->', sumdb_jca, Soo_jca)
+
+                # case3
+                sumab_ij = numpy.einsum('jab,a,jb->j', co_t2_i, co_ovlp_ov[i], co_ovlp_ov[i0:])
+                sumijab += numpy.einsum('j,j->', sumab_ij, co_ovlp_oo_inv_ij[i,i0:])
+
+                sumlcd_i = numpy.dot(sumcd_ij, co_ovlp_oo_inv)
+                sumjab_i = numpy.dot(sumab_ij, co_ovlp_oo_inv[i0:])
+                term2_case3 -= sumlcd_i * sumjab_i * co_ovlp_oo_inv2[i]
+                term2_case3 += 0.5 * numpy.sum(sumcd_ij[i0:] * sumab_ij *
+                                               co_ovlp_oo_inv2[i] * co_ovlp_oo_inv2[i0:])
+
         term2_case3 = 0.25 * sumklcd * sumijab + term2_case3
 
         ######################
@@ -1079,7 +812,9 @@ class SPPT2:
         """ 
         mo_coeff = ump2.mo_coeff
         mo_occ = ump2.mo_occ
-        
+        if ump2.frozen:
+            self.frozen = ump2.frozen       
+ 
         if not isinstance(self.rotated_mo_coeffs, numpy.ndarray):
             self.get_rotated_mo_coeffs(mo_coeff, proj=proj, N_alpha=N_alpha, N_beta=N_beta, N_gamma=N_gamma, verbose=verbose)
         
@@ -1089,7 +824,7 @@ class SPPT2:
         energy_01 = 0.
         norm_00 = 0.
         norm_01 = 0.
-        
+
         if proj == 'part':
             for b in range(N_beta):
                 rot_mo_coeff = rot_mo_coeffs[b]
@@ -1144,6 +879,8 @@ class SPPT2:
         """ 
         mo_coeff = ump2.mo_coeff
         mo_occ = ump2.mo_occ
+        if ump2.frozen:
+            self.frozen = ump2.frozen
         
         if not isinstance(self.rotated_mo_coeffs, numpy.ndarray):
             self.get_rotated_mo_coeffs(mo_coeff, proj=proj, N_alpha=N_alpha, N_beta=N_beta, N_gamma=N_gamma, verbose=verbose)
@@ -1287,11 +1024,15 @@ class SPPT2:
         nocc = self.nocc
         nmo = self.nmo
         nvir = nmo - nocc
+        if self.frozen:
+            v_oo = v_oo[self.frozen:,self.frozen:]
+            nocc = nocc - self.frozen
+
         fac = 2 if mo_t2.dtype==numpy.complex else 1
         mem_incore = (nocc*nvir)**2*8*fac/1e6
         mem_now = lib.current_memory()[0]
         if mem_incore+mem_now > self.max_memory*.9:
-            co_t2 = _make_co_t2_outcore(self, mo_t2, v_oo)
+            co_t2 = _make_co_t2_outcore(self, mo_t2, v_oo, nvir)
         else:
             co_t2 = lib.einsum('pi,qj,pqab->ijab', v_oo, v_oo, mo_t2)
         return co_t2
@@ -1611,11 +1352,9 @@ class _ChemistsERIs:
         self.nocc = nocc
         return self
 
-def _make_co_t2_outcore(mp, t2, v_oo):
+def _make_co_t2_outcore(mp, t2, v_oo, nvir):
     cput0 = (logger.process_clock(), logger.perf_counter())
-    nocc = mp.nocc
-    nmo = mp.nmo
-    nvir = nmo - nocc
+    nocc = v_oo.shape[0]
 
     filename = mp.co_t2_file = tempfile.NamedTemporaryFile(dir=param.TMPDIR)
     fp = numpy.memmap(filename, dtype=t2.dtype, mode='w+', shape=(nocc**2*nvir**2))

@@ -12,7 +12,7 @@ Cl         1.41754       -1.02456       -1.18260
 '''
 mol.basis = 'ccpvdz'
 mol.charge = -4
-mol.max_memory=20000
+mol.max_memory=25000
 mol.verbose = 5
 mol.build()
 
