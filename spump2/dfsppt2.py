@@ -1,5 +1,7 @@
 """
-V13 
+Density-fitted spin-projected MP2
+
+V13
     - This version does UHF -> UMP2 -> P.
     - Using simplified projector as default. 
     - CO version using Van Voorhis' equations.
@@ -8,7 +10,7 @@ V13
         
     - Optimize with einsum.
 
-Reference:
+Related reference:
     1. J. Chem. Phys. 139, 174104 (2013)
 """
 
@@ -412,13 +414,13 @@ class SPPT2:
         coeffs = None
         
         if proj == 'part':
-            coeffs = numpy.zeros(N_beta, dtype=numpy.float)
+            coeffs = numpy.zeros((N_beta,))
             
             for b, beta_b in enumerate(betas):
                 coeffs[b] = ws[b] * self.get_wigner_d(s, m, k, beta_b)
                 
         elif proj == 'full':
-            coeffs = numpy.zeros((N_alpha, N_beta, N_gamma), dtype=numpy.complex)
+            coeffs = numpy.zeros((N_alpha, N_beta, N_gamma), dtype=numpy.complex128)
         
             for a, alpha_a in enumerate(alphas):
                 for b, beta_b in enumerate(betas):
@@ -440,7 +442,7 @@ class SPPT2:
                               determinants.
         """
         #if not isinstance(self.mo_eri, numpy.ndarray):
-        #    if mo_coeff1.dtype != numpy.complex:
+        #    if mo_coeff1.dtype != numpy.complex128:
         #        self.get_mo_eri_real(mo_coeff1)
         #    else:
         #        self.get_mo_eri_complex(mo_coeff1)
@@ -688,7 +690,7 @@ class SPPT2:
         nvir = nmo - nocc
         i0 = self.frozen if self.frozen else 0
 
-        complex_orb = co_ovlp.dtype==numpy.complex
+        complex_orb = co_ovlp.dtype==numpy.complex128
 
         # Get the U, S, V matrices.
         u_oo, co_ovlp_oo_diag, v_oo = self.get_co_ovlp_oo(mo_coeff1, mo_coeff2)
@@ -987,7 +989,7 @@ class SPPT2:
             dtype = self.mo_coeff.dtype
         else:
             dtype = mo_coeff.dtype
-        fac = 2 if dtype==numpy.complex else 1
+        fac = 2 if dtype==numpy.complex128 else 1
         #mo_eri, co_eri, co_t2
         #FIXME need to consider temporary memory used
         mem_incore = ((nocc*nmo)**2+2*(nocc*nvir)**2)*8*fac/1e6
@@ -1028,7 +1030,7 @@ class SPPT2:
             v_oo = v_oo[self.frozen:,self.frozen:]
             nocc = nocc - self.frozen
 
-        fac = 2 if mo_t2.dtype==numpy.complex else 1
+        fac = 2 if mo_t2.dtype==numpy.complex128 else 1
         mem_incore = (nocc*nvir)**2*8*fac/1e6
         mem_now = lib.current_memory()[0]
         if mem_incore+mem_now > self.max_memory*.9:
@@ -1113,7 +1115,7 @@ def get_all_doubles(mo_occ, nocc, nmo):
 def _ao2mo_loop(mp, eris, max_memory=2000):
     mo_coeff = eris.mo_coeff
     nao = mo_coeff.shape[0]
-    complex_orb = mo_coeff.dtype == numpy.complex
+    complex_orb = mo_coeff.dtype == numpy.complex128
     nocc, nmo = eris.nocc, eris.nmo
 
     moa = mo_coeff[:nao//2]
@@ -1239,7 +1241,7 @@ def _make_eris_outcore(mp, mo_coeff=None, nocc=None):
 
 def _ao2co_loop(mp, mo_coeff, co, max_memory=2000):
     nao = mo_coeff.shape[0]
-    complex_orb = mo_coeff.dtype == numpy.complex
+    complex_orb = mo_coeff.dtype == numpy.complex128
     nocc, nmo = co.shape[1], mo_coeff.shape[1]
     nvir = nmo - nocc
 

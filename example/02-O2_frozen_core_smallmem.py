@@ -1,7 +1,10 @@
 from pyscf import gto, scf, mp
 
 mol = gto.Mole()
-mol.atom = [['O', (i*2.,0.,0.)] for i in range(2)]
+mol.atom = '''
+    O 0 0 0
+    O 0 0 1.16
+'''
 mol.basis = 'ccpvtz'
 mol.max_memory=200
 mol.verbose = 5

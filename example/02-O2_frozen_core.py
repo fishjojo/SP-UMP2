@@ -1,7 +1,10 @@
 from pyscf import gto, scf, mp
 
 mol = gto.Mole()
-mol.atom = [['O', (i*2.,0.,0.)] for i in range(2)]
+mol.atom = '''
+    O 0 0 0
+    O 0 0 1.16
+'''
 mol.basis = 'ccpvtz'
 mol.max_memory=2000
 mol.verbose = 5
@@ -11,6 +14,7 @@ mf = scf.UHF(mol).density_fit()
 dm0 = mf.get_init_guess()
 dm0[0][0] += 1.
 dm0[0] += dm0[0].T
+mf.max_cycle = 100
 mf.kernel(dm0=dm0)
 mf = mf.to_ghf()
 
