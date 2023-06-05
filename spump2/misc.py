@@ -108,13 +108,13 @@ def get_norm00(mol, mo_coeff, s, m, k, n_beta, n_gamma):
     out = 0
     for gamma, wg in zip(gs, wgs):
         mo1 = apply_Rz(mo_coeff, gamma)
-        fac1 = fac * np.exp(-1j*k*gamma)
+        fac1 = fac * np.exp(1j*k*gamma)
         for i, (beta, wb) in enumerate(zip(bs, wbs)):
             mo2 = apply_Ry(mo1, beta)
             for alpha, wa in zip(gs, wgs):
                 mo3 = apply_Rz(mo2, alpha)
                 ovlp = get_det_ovlp(mol, mo_coeff, mo3)
-                out += fac1 * dmat[i] * ovlp * wa * wb * wg * np.exp(-1j*m*alpha)
+                out += fac1 * dmat[i] * ovlp * wa * wb * wg * np.exp(1j*m*alpha)
     return out
 
 
@@ -128,6 +128,7 @@ if __name__ == '__main__':
     '''
     mol.basis = 'ccpvdz'
     mol.verbose = 5
+    mol.spin = 2
     mol.build()
 
     mf = scf.UHF(mol)
@@ -136,9 +137,9 @@ if __name__ == '__main__':
     mo0 = mf.mo_coeff[:,mf.mo_occ>0]
 
     s = 1
-    m = 0
+    m = 1
     print(get_norm00_collinear(mol, mo0, s, m, m, 10))
 
     m = 1
-    k = -1
-    print(get_norm00(mol, mo0, s, m, k, 10, 10))
+    for k in (-1, 0, 1):
+        print(get_norm00(mol, mo0, s, m, k, 10, 10))
