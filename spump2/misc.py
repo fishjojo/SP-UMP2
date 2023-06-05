@@ -76,7 +76,7 @@ def dmatrix_element(s, m, k, beta):
     out = tmp.sum() * fac
     return out
 
-def get_norm00_collinear(mol, mo_coeff, s, m, k, n_beta):
+def get_norm00_collinear(mol, mo_coeff, s, m, k, n_beta, s1e=None):
     r'''Compute :math:`\int d\Omega w(\Omega) <0|\hat{R}(\Omega)|0>`,
     where :math:`|0>` is an eigenstate of :math:`\hat{S}_z`.
     In this case, :math:`m = k = S_{z}`,
@@ -84,19 +84,25 @@ def get_norm00_collinear(mol, mo_coeff, s, m, k, n_beta):
     give constants :math:`2\pi`.
     '''
     assert m == k
+    if s1e is None:
+        s1e = mol.intor('int1e_ovlp', hermi=1)
+
     bs, ws = quadrature_Ry(n_beta)
     fac = (2.*s + 1.) / 2.
 
     out = 0
     for beta, w in zip(bs, ws):
         mo1 = apply_Ry(mo_coeff, beta)
-        ovlp = get_det_ovlp(mol, mo_coeff, mo1)
+        ovlp = get_det_ovlp(mol, mo_coeff, mo1, s1e)
         out += fac * dmatrix_element(s, m, k, beta) * ovlp * w
     return out
 
-def get_norm00(mol, mo_coeff, s, m, k, n_beta, n_gamma):
+def get_norm00(mol, mo_coeff, s, m, k, n_beta, n_gamma, s1e=None):
     r'''Compute :math:`\int d\Omega w(\Omega) <0|\hat{R}(\Omega)|0>`.
     '''
+    if s1e is None:
+        s1e = mol.intor('int1e_ovlp', hermi=1)
+
     bs, wbs = quadrature_Ry(n_beta)
     gs, wgs = quadrature_Rz(n_gamma)
     fac = (2.*s + 1.) / (8 * np.pi**2)
@@ -113,7 +119,7 @@ def get_norm00(mol, mo_coeff, s, m, k, n_beta, n_gamma):
             mo2 = apply_Ry(mo1, beta)
             for alpha, wa in zip(gs, wgs):
                 mo3 = apply_Rz(mo2, alpha)
-                ovlp = get_det_ovlp(mol, mo_coeff, mo3)
+                ovlp = get_det_ovlp(mol, mo_coeff, mo3, s1e)
                 out += fac1 * dmat[i] * ovlp * wa * wb * wg * np.exp(1j*m*alpha)
     return out
 
