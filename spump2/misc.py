@@ -56,6 +56,10 @@ def quadrature_Rz(n):
     gamma = np.linspace(0, 2*np.pi, n, endpoint=False)
     return gamma, np.repeat(2*np.pi/n, n)
 
+def quadrature_Rz_4pi(n):
+    gamma = np.linspace(0, 4*np.pi, 2*n, endpoint=False)
+    return gamma, np.repeat(4*np.pi/(2*n), 2*n)
+
 def dmatrix_element(s, m, k, beta):
     r'''Wigner small d-matrix element:
     :math:`d^{s}_{m k} (\beta)`.
@@ -105,7 +109,9 @@ def get_norm00(mol, mo_coeff, s, m, k, n_beta, n_gamma, s1e=None):
 
     bs, wbs = quadrature_Ry(n_beta)
     gs, wgs = quadrature_Rz(n_gamma)
-    fac = (2.*s + 1.) / (8 * np.pi**2)
+    alphas, was = quadrature_Rz_4pi(n_gamma)
+
+    fac = (2.*s + 1.) / (16 * np.pi**2) #double volume integration
 
     dmat = np.empty((n_beta,))
     for i in range(n_beta):
@@ -117,7 +123,7 @@ def get_norm00(mol, mo_coeff, s, m, k, n_beta, n_gamma, s1e=None):
         fac1 = fac * np.exp(1j*k*gamma)
         for i, (beta, wb) in enumerate(zip(bs, wbs)):
             mo2 = apply_Ry(mo1, beta)
-            for alpha, wa in zip(gs, wgs):
+            for alpha, wa in zip(alphas, was):
                 mo3 = apply_Rz(mo2, alpha)
                 ovlp = get_det_ovlp(mol, mo_coeff, mo3, s1e)
                 out += fac1 * dmat[i] * ovlp * wa * wb * wg * np.exp(1j*m*alpha)

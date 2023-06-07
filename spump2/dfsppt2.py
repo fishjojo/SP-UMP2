@@ -28,6 +28,7 @@ from pyscf.scf import hf
 from pyscf import df
 from pyscf.ao2mo import _ao2mo
 
+from .misc import apply_Ry, apply_Rz
 from . import lib as tools
 libnp_helper = tools.load_library("libnp_helper")
 
@@ -320,42 +321,6 @@ class SPPT2:
         dfgmp2 = mp.GMP2(uhf).density_fit().run()
         return dfgmp2
     
-    def Ry(self, mo_coeff, beta):
-        """
-        Rotates the spin components of the determinants in the coefficient matrix `mo_coeff` by angle `beta`
-        about the y axis.
-        
-        Args
-            mo_coeff (ndarray): MO coefficient matrix from a GHF object.
-            beta (float): Rotation angle.
-            
-        Returns
-            The rotated coefficient matrix.
-        """
-        nao = self.mol.nao
-        id_mat = numpy.eye(nao)
-        Ry_mat = numpy.block([[numpy.cos(beta/2) * id_mat, -numpy.sin(beta/2) * id_mat],
-                              [numpy.sin(beta/2) * id_mat, numpy.cos(beta/2) * id_mat]])
-        return numpy.dot(Ry_mat, mo_coeff)
-    
-    def Rz(self, mo_coeff, theta):
-        """
-        Rotates the spin components of the determinants in the coefficient matrix `mo_coeff` by angle `theta`
-        about the z axis.
-        
-        Args
-            mo_coeff (ndarray): MO coefficient matrix from a GHF object.
-            theta (float): Rotation angle.
-            
-        Returns
-            The rotated coefficient matrix.
-        """
-        nao = self.mol.nao
-        id_mat = numpy.eye(nao)
-        Rz_mat = numpy.block([[numpy.exp(-1j * theta/2) * id_mat, numpy.zeros((nao, nao))],
-                              [numpy.zeros((nao, nao)), numpy.exp(1j * theta/2) * id_mat]])
-        return numpy.dot(Rz_mat, mo_coeff)
-    
     def get_rotated_mo_coeffs(self, mo_coeff, proj='part', N_alpha=None, N_beta=None, N_gamma=None, verbose=False):
         """
         Generates rotated coefficient matrices from `mo_coeff` at each quadrature point.
@@ -374,7 +339,7 @@ class SPPT2:
         
         if proj == 'part':
             for b, beta_b in enumerate(betas):
-                y = self.Ry(mo_coeff, beta_b)
+                y = apply_Ry(mo_coeff, beta_b)
                 rotated_mo_coeffs.append(y)
                 
         elif proj == 'full':
@@ -385,9 +350,9 @@ class SPPT2:
                     mo2 = []
 
                     for c, gamma_c in enumerate(gammas):
-                        z = self.Rz(mo_coeff, gamma_c)
-                        yz = self.Ry(z, beta_b)
-                        zyz = self.Rz(yz, alpha_a)
+                        z = apply_Rz(mo_coeff, gamma_c)
+                        yz = apply_Ry(z, beta_b)
+                        zyz = apply_Rz(yz, alpha_a)
                         mo2.append(zyz)
 
                     mo1.append(mo2)
